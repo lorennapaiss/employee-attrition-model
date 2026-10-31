@@ -1,11 +1,11 @@
-"""Generates attrition-dashboard/bp_attrition_dashboard.html from risk ranking CSV."""
+"""Generates dashboard/bp_attrition_dashboard.html from risk ranking CSV."""
 import pandas as pd
 import json
 import os
 
-BASE = r'C:\Users\loren\Documents\Projetos - Portfólio\employee-attrition'
+BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CSV  = os.path.join(BASE, 'data', 'raw', 'attrition_risk_ranking.csv')
-OUT  = os.path.join(BASE, 'attrition-dashboard', 'bp_attrition_dashboard.html')
+OUT  = os.path.join(BASE, 'dashboard', 'bp_attrition_dashboard.html')
 
 df = pd.read_csv(CSV)
 
@@ -31,23 +31,30 @@ FACTOR_LABELS = {
     'low_income':      'Salário baixo',
 }
 
+PROB    = df['Probabilidade_Saida_Pct']
+AT_RISK = df['Acao_RH'] == 'Conversa recomendada'
+
 # ── KPIs ─────────────────────────────────────────────────────────────────────
 kpis = {
     'total':     int(len(df)),
     'alto':      int((df['Faixa_Risco'] == 'Alto').sum()),
     'medio':     int((df['Faixa_Risco'] == 'Medio').sum()),
-    'acao':      int((df['Acao_RH'] == 'Conversa recomendada').sum()),
+    'baixo':     int((df['Faixa_Risco'] == 'Baixo').sum()),
+    'acao':      int(AT_RISK.sum()),
     'pct_risco': round((df['Faixa_Risco'] != 'Baixo').sum() / len(df) * 100, 1),
+    'prob_media': round(float(PROB.mean()), 1),
 }
 
-# ── donut ────────────────────────────────────────────────────────────────────
-vc = df['Faixa_Risco'].value_counts()
-donut = {
-    'labels': ['Alto Risco', 'Risco Médio', 'Baixo Risco'],
-    'values': [int(vc.get('Alto', 0)), int(vc.get('Medio', 0)), int(vc.get('Baixo', 0))],
-}
+# ── probability histogram (2.5pp bins) ───────────────────────────────────────
+STEP = 2.5
+hist = []
+for i in range(40):
+    lo = i * STEP
+    hi = lo + STEP
+    mask = (PROB >= lo) & ((PROB < hi) if i < 39 else (PROB <= hi))
+    hist.append({'lo': lo, 'hi': hi, 'n': int(mask.sum())})
 
-# ── dept bar ─────────────────────────────────────────────────────────────────
+# ── dept breakdown ───────────────────────────────────────────────────────────
 dept_rows = []
 for dept in df['Department'].unique():
     s = df[df['Department'] == dept]
@@ -61,12 +68,33 @@ for dept in df['Department'].unique():
     })
 dept_rows.sort(key=lambda x: -x['pct_risco'])
 
-# ── role horizontal bar (top 10 avg prob) ────────────────────────────────────
-role_avg = (df.groupby('JobRole')['Probabilidade_Saida_Pct']
-              .mean()
-              .sort_values(ascending=False)
-              .head(10))
-role_data = [{'role': r, 'avg': round(float(v), 1)} for r, v in role_avg.items()]
+# ── avg probability by tenure, per dept ──────────────────────────────────────
+TENURE_BINS = [(i, i, str(i)) for i in range(11)] + [(11, 15, '11–15'), (16, 20, '16–20'), (21, 99, '21+')]
+tenure = {'labels': [b[2] for b in TENURE_BINS], 'series': []}
+for dept in df['Department'].value_counts().index:
+    s = df[df['Department'] == dept]
+    vals, ns = [], []
+    for lo, hi, _ in TENURE_BINS:
+        p = s.loc[s['YearsAtCompany'].between(lo, hi), 'Probabilidade_Saida_Pct']
+        vals.append(round(float(p.mean()), 1) if len(p) >= 5 else None)
+        ns.append(int(len(p)))
+    tenure['series'].append({'dept': dept, 'values': vals, 'n': ns})
+
+# ── roles: share of at-risk employees (top 6 + others) ───────────────────────
+role_grp = (df.assign(at_risk=AT_RISK)
+              .groupby('JobRole')
+              .agg(n_risco=('at_risk', 'sum'), avg=('Probabilidade_Saida_Pct', 'mean'), total=('EmployeeID', 'size'))
+              .sort_values('n_risco', ascending=False))
+role_data = [{'role': r, 'n_risco': int(v.n_risco), 'avg': round(float(v.avg), 1), 'total': int(v.total)}
+             for r, v in role_grp.head(6).iterrows()]
+rest = role_grp.iloc[6:]
+if len(rest):
+    role_data.append({
+        'role':    'Outros cargos',
+        'n_risco': int(rest['n_risco'].sum()),
+        'avg':     round(float((rest['avg'] * rest['total']).sum() / rest['total'].sum()), 1),
+        'total':   int(rest['total'].sum()),
+    })
 
 # ── employee list (all, JS does filtering) ───────────────────────────────────
 employees = []
@@ -94,801 +122,872 @@ employees.sort(key=lambda x: -x['prob'])
 
 payload = {
     'kpis':      kpis,
-    'donut':     donut,
+    'hist':      hist,
     'dept_data': dept_rows,
+    'tenure':    tenure,
     'role_data': role_data,
     'employees': employees,
 }
 data_json = json.dumps(payload, ensure_ascii=False)
 
 # ── HTML template ─────────────────────────────────────────────────────────────
-HTML = '''<!DOCTYPE html>
+HTML = r'''<!DOCTYPE html>
 <html lang="pt-BR">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Painel de Risco · HR Business Partner</title>
-<link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,400;0,9..144,600;0,9..144,700;1,9..144,400&family=DM+Sans:wght@300;400;500;600&display=swap" rel="stylesheet">
+<title>Attrition Risk · HR Business Partner</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 <style>
 *,*::before,*::after{margin:0;padding:0;box-sizing:border-box}
 
 :root{
-  --navy:#0F172A; --navy2:#1E293B; --navy3:#334155;
-  --bg:#F1F5F9; --surface:#FFFFFF; --border:#E2E8F0;
-  --red:#DC2626; --red-l:#FEF2F2; --red-m:#FCA5A5;
-  --amber:#D97706; --amber-l:#FFFBEB; --amber-m:#FCD34D;
-  --green:#16A34A; --green-l:#F0FDF4; --green-m:#86EFAC;
-  --purple:#7C3AED; --purple-l:#F5F3FF;
-  --blue:#2563EB; --blue-l:#EFF6FF;
-  --text:#0F172A; --muted:#64748B; --subtle:#94A3B8;
-  --font-d:'Fraunces',Georgia,serif;
-  --font-b:'DM Sans',system-ui,sans-serif;
-  --sidebar-w:240px;
-  --radius:10px;
-  --shadow:0 1px 3px rgba(0,0,0,.08),0 1px 2px rgba(0,0,0,.06);
-  --shadow-md:0 4px 6px rgba(0,0,0,.07),0 2px 4px rgba(0,0,0,.06);
+  --page:#E8ECE8; --surface:#FFFFFF; --soft:#F6F6F4; --hover:#FAFAF8;
+  --line:#ECECE9; --line-2:#E2E2DE;
+  --ink:#151517; --text:#2A2A2E; --muted:#6E6E73; --subtle:#A1A1A6;
+  /* status: risk tiers (always paired with a text label) */
+  --alto:#E5486B; --alto-l:#FDEDF1;
+  --medio:#E9B10F; --medio-l:#FDF6DD;
+  --baixo:#1FAF55; --baixo-l:#E7F7EC;
+  --lime:#C7E35A;
+  /* categorical: departments (validated CVD-safe) */
+  --d1:#4263EB; --d2:#0E9AA7; --d3:#9C36B5;
+  --font:'Inter',system-ui,-apple-system,'Segoe UI',sans-serif;
+  --radius:14px;
 }
 
 html{scroll-behavior:smooth}
 body{
-  background:var(--bg);
+  background:var(--page);
   color:var(--text);
-  font-family:var(--font-b);
-  display:flex;
+  font-family:var(--font);
+  font-size:14px;
+  font-feature-settings:'tnum' 1,'cv11' 1;
+  -webkit-font-smoothing:antialiased;
+  padding:28px;
   min-height:100vh;
 }
+button,input,select{font-family:inherit}
+svg.i{width:14px;height:14px;stroke:currentColor;fill:none;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round;flex-shrink:0}
 
-/* ── SIDEBAR ─────────────────────────────────────────────────── */
-.sidebar{
-  width:var(--sidebar-w);
-  min-width:var(--sidebar-w);
-  background:var(--navy);
-  display:flex;
-  flex-direction:column;
-  position:fixed;
-  top:0;left:0;bottom:0;
-  overflow-y:auto;
-  z-index:100;
-}
-.sidebar-header{
-  padding:28px 20px 20px;
-  border-bottom:1px solid rgba(255,255,255,.07);
-}
-.sidebar-logo{
-  font-family:var(--font-d);
-  font-size:1.05rem;
-  font-weight:600;
-  color:#fff;
-  line-height:1.2;
-  letter-spacing:-.01em;
-}
-.sidebar-logo span{
-  display:block;
-  font-size:.68rem;
-  font-family:var(--font-b);
-  font-weight:400;
-  color:rgba(255,255,255,.45);
-  letter-spacing:.08em;
-  text-transform:uppercase;
-  margin-top:3px;
-}
-.sidebar-nav{
-  padding:16px 10px;
-  flex:1;
-}
-.nav-label{
-  font-size:.6rem;
-  font-weight:600;
-  letter-spacing:.12em;
-  text-transform:uppercase;
-  color:rgba(255,255,255,.3);
-  padding:8px 10px 4px;
-}
-.nav-item{
-  display:flex;
-  align-items:center;
-  gap:10px;
-  padding:9px 12px;
-  border-radius:7px;
-  cursor:pointer;
-  color:rgba(255,255,255,.55);
-  font-size:.825rem;
-  font-weight:400;
-  text-decoration:none;
-  transition:all .15s;
-  margin-bottom:2px;
-}
-.nav-item:hover{background:rgba(255,255,255,.07);color:rgba(255,255,255,.9)}
-.nav-item.active{background:rgba(255,255,255,.12);color:#fff;font-weight:500}
-.nav-icon{font-size:1rem;opacity:.8}
-
-.sidebar-stats{
-  padding:16px 14px 20px;
-  border-top:1px solid rgba(255,255,255,.07);
-}
-.stat-mini{
-  padding:10px 12px;
-  border-radius:7px;
-  background:rgba(255,255,255,.05);
-  margin-bottom:8px;
-}
-.stat-mini-label{font-size:.65rem;color:rgba(255,255,255,.4);text-transform:uppercase;letter-spacing:.08em}
-.stat-mini-val{font-size:1.3rem;font-weight:600;color:#fff;font-family:var(--font-d);line-height:1.2;margin-top:1px}
-.stat-mini-sub{font-size:.68rem;color:rgba(255,255,255,.4);margin-top:1px}
-
-.badge-red{background:rgba(220,38,38,.25);color:#FCA5A5;font-size:.65rem;font-weight:600;padding:2px 7px;border-radius:20px}
-.badge-amber{background:rgba(217,119,6,.25);color:#FCD34D;font-size:.65rem;font-weight:600;padding:2px 7px;border-radius:20px}
-
-/* ── MAIN ────────────────────────────────────────────────────── */
-.main{
-  margin-left:var(--sidebar-w);
-  flex:1;
-  padding:32px 28px 60px;
-  max-width:1200px;
-}
-
-.section{margin-bottom:52px}
-.section-title{
-  font-family:var(--font-d);
-  font-size:1.45rem;
-  font-weight:600;
-  color:var(--text);
-  letter-spacing:-.02em;
-  margin-bottom:6px;
-}
-.section-sub{font-size:.82rem;color:var(--muted);margin-bottom:22px}
-
-/* ── KPI CARDS ───────────────────────────────────────────────── */
-.kpi-grid{
-  display:grid;
-  grid-template-columns:repeat(4,1fr);
-  gap:14px;
-  margin-bottom:24px;
-}
-.kpi-card{
+/* ── APP FRAME ───────────────────────────────────────────────── */
+.app{
+  max-width:1320px;
+  margin:0 auto;
   background:var(--surface);
   border-radius:var(--radius);
-  padding:18px 20px;
-  box-shadow:var(--shadow);
-  border:1px solid var(--border);
-  position:relative;
+  box-shadow:0 1px 2px rgba(20,20,20,.04),0 24px 48px -24px rgba(20,20,20,.18);
   overflow:hidden;
 }
-.kpi-card::before{
-  content:'';
-  position:absolute;top:0;left:0;right:0;
-  height:3px;
-  border-radius:var(--radius) var(--radius) 0 0;
-}
-.kpi-card.kpi-total::before{background:var(--blue)}
-.kpi-card.kpi-alto::before{background:var(--red)}
-.kpi-card.kpi-medio::before{background:var(--amber)}
-.kpi-card.kpi-acao::before{background:var(--purple)}
 
-.kpi-label{font-size:.7rem;font-weight:600;text-transform:uppercase;letter-spacing:.08em;color:var(--muted)}
-.kpi-value{
-  font-family:var(--font-d);
-  font-size:2rem;
-  font-weight:700;
-  color:var(--text);
-  line-height:1.1;
-  margin:4px 0 2px;
-}
-.kpi-card.kpi-alto .kpi-value{color:var(--red)}
-.kpi-card.kpi-medio .kpi-value{color:var(--amber)}
-.kpi-card.kpi-acao .kpi-value{color:var(--purple)}
-.kpi-desc{font-size:.73rem;color:var(--muted)}
-
-/* ── CHARTS ROW ──────────────────────────────────────────────── */
-.charts-row{
+/* ── TOP BAR ─────────────────────────────────────────────────── */
+.topbar{
   display:grid;
-  grid-template-columns:280px 1fr;
-  gap:16px;
-  margin-bottom:16px;
-}
-.chart-card{
-  background:var(--surface);
-  border-radius:var(--radius);
-  padding:20px;
-  box-shadow:var(--shadow);
-  border:1px solid var(--border);
-}
-.chart-title{
-  font-size:.8rem;
-  font-weight:600;
-  text-transform:uppercase;
-  letter-spacing:.07em;
-  color:var(--muted);
-  margin-bottom:16px;
-}
-.donut-wrap{
-  position:relative;
-  width:160px;
-  height:160px;
-  margin:0 auto 16px;
-}
-.donut-legend{display:flex;flex-direction:column;gap:7px;margin-top:4px}
-.legend-item{display:flex;align-items:center;gap:8px;font-size:.78rem;color:var(--text)}
-.legend-dot{width:9px;height:9px;border-radius:50%;flex-shrink:0}
-.legend-val{margin-left:auto;font-weight:600;color:var(--muted);font-size:.75rem}
-
-/* ── ROLE CHART ──────────────────────────────────────────────── */
-.role-card{
-  background:var(--surface);
-  border-radius:var(--radius);
-  padding:20px;
-  box-shadow:var(--shadow);
-  border:1px solid var(--border);
-  margin-bottom:16px;
-}
-
-/* ── FILTERS BAR ─────────────────────────────────────────────── */
-.filters-bar{
-  display:flex;
-  flex-wrap:wrap;
+  grid-template-columns:1fr auto 1fr;
   align-items:center;
-  gap:10px;
-  background:var(--surface);
-  border-radius:var(--radius);
-  padding:14px 18px;
-  box-shadow:var(--shadow);
-  border:1px solid var(--border);
-  margin-bottom:14px;
+  padding:0 18px;
+  height:60px;
+  border-bottom:1px solid var(--line);
 }
-.search-wrap{
+.brand{display:flex;align-items:center;gap:10px;font-weight:600;color:var(--ink);font-size:.95rem;letter-spacing:-.01em}
+.brand-mark{
+  width:28px;height:28px;border-radius:7px;background:var(--ink);
+  display:grid;place-items:center;color:#fff;
+}
+.brand-mark svg{width:15px;height:15px}
+.brand small{display:block;font-size:.68rem;font-weight:500;color:var(--muted);letter-spacing:0}
+.tabs{display:flex;gap:4px;height:60px;scrollbar-width:none}
+.tabs::-webkit-scrollbar{display:none}
+.tab{
   position:relative;
-  flex:1;
-  min-width:180px;
+  display:flex;align-items:center;
+  padding:0 14px;
+  border:none;background:none;cursor:pointer;
+  font-size:.84rem;font-weight:500;color:var(--muted);
+  transition:color .15s;
+  white-space:nowrap;
 }
-.search-icon{
-  position:absolute;left:10px;top:50%;transform:translateY(-50%);
-  color:var(--muted);font-size:.85rem;pointer-events:none;
+.tab:hover{color:var(--ink)}
+.tab.active{color:var(--ink)}
+.tab.active::after{
+  content:'';position:absolute;left:10px;right:10px;bottom:-1px;height:2px;
+  background:var(--ink);border-radius:2px;
 }
-.search-input{
-  width:100%;
-  padding:7px 10px 7px 30px;
-  border:1px solid var(--border);
-  border-radius:7px;
-  font-family:var(--font-b);
-  font-size:.82rem;
-  color:var(--text);
-  background:var(--bg);
-  outline:none;
-  transition:border .15s;
+.top-actions{display:flex;justify-content:flex-end}
+.btn{
+  display:inline-flex;align-items:center;gap:7px;
+  padding:8px 13px;
+  border:1px solid var(--line-2);border-radius:9px;
+  background:var(--surface);color:var(--ink);
+  font-size:.8rem;font-weight:500;cursor:pointer;
+  box-shadow:0 1px 2px rgba(20,20,20,.05);
+  transition:background .15s;
 }
-.search-input:focus{border-color:var(--blue)}
-.filter-select{
-  padding:7px 28px 7px 10px;
-  border:1px solid var(--border);
-  border-radius:7px;
-  font-family:var(--font-b);
-  font-size:.82rem;
-  color:var(--text);
-  background:var(--bg);
-  outline:none;
-  cursor:pointer;
-  appearance:none;
-  -webkit-appearance:none;
-  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%2364748B' stroke-width='2'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");
-  background-repeat:no-repeat;
-  background-position:right 8px center;
+.btn:hover{background:var(--soft)}
+
+.subbar{
+  display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap;
+  padding:9px 18px;
+  background:var(--soft);
+  border-bottom:1px solid var(--line);
+  font-size:.74rem;color:var(--muted);
 }
-.toggle-btn{
+.subbar span{display:inline-flex;align-items:center;gap:6px}
+.subbar b{font-weight:500;color:var(--text)}
+
+/* ── VIEWS & GRID ────────────────────────────────────────────── */
+.view{display:none}
+.view.active{display:block}
+
+.grid{display:grid;grid-template-columns:minmax(0,1.12fr) minmax(0,1fr)}
+.col{min-width:0}
+.col + .col{border-left:1px solid var(--line)}
+.panel{padding:24px 26px;border-bottom:1px solid var(--line);min-width:0}
+.panel:last-child{border-bottom:none}
+.split{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);border-bottom:1px solid var(--line)}
+.split .panel{border-bottom:none}
+.split .panel + .panel{border-left:1px solid var(--line)}
+
+.panel-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:18px}
+.panel-title{font-size:1.06rem;font-weight:600;color:var(--ink);letter-spacing:-.015em}
+.panel-sub{font-size:.76rem;color:var(--muted);margin-top:4px}
+.eyebrow{
+  font-size:.64rem;font-weight:600;letter-spacing:.07em;text-transform:uppercase;color:var(--muted);
+}
+.num{font-size:1.02rem;font-weight:700;color:var(--ink);letter-spacing:-.01em;margin-top:6px}
+.num-lg{font-size:1.5rem}
+.delta{font-size:.72rem;font-weight:600;color:var(--muted);margin-left:6px}
+
+/* ── KPI TRIO ────────────────────────────────────────────────── */
+.kpis{display:grid;grid-template-columns:repeat(3,1fr)}
+.kpi{padding:0 20px;min-width:0}
+.kpi:first-child{padding-left:0}
+.kpi:last-child{padding-right:0}
+.kpi + .kpi{border-left:1px solid var(--line)}
+.kpi-viz{margin-top:14px;height:34px;position:relative}
+
+.barcode{display:flex;align-items:flex-end;gap:2px;height:28px;margin-top:6px}
+.barcode i{flex:1;border-radius:1px;min-height:3px}
+.marker{
+  position:absolute;top:-2px;width:0;height:0;transform:translateX(-50%);
+  border-left:4px solid transparent;border-right:4px solid transparent;border-top:6px solid var(--ink);
+}
+
+.gauge-wrap{position:relative;margin-top:21px}
+.gauge-wrap .marker{top:-9px}
+.gauge{display:flex;gap:2px;height:7px}
+.gauge i{height:100%;border-radius:1px}
+.gauge-rest{background:var(--line-2)}
+
+.meter{height:7px;background:var(--line);border-radius:2px;margin-top:21px;overflow:hidden}
+.meter i{display:block;height:100%;background:var(--ink);border-radius:2px}
+.meter-cap{display:flex;justify-content:space-between;font-size:.68rem;color:var(--subtle);margin-top:6px}
+
+/* ── DISTRIBUTION (invoices-style) ───────────────────────────── */
+.dist{display:flex;gap:2px}
+.dist-col{min-width:0;display:flex;flex-direction:column}
+.dist-meta{padding:0 12px 0 10px;border-left:1px solid var(--line);height:96px;display:flex;flex-direction:column}
+.dist-col:first-child .dist-meta{border-left:none;padding-left:0}
+.dist-meta .eyebrow{white-space:nowrap}
+.dist-pct{margin-top:auto;padding-bottom:10px;font-size:.76rem;color:var(--muted)}
+.dist-bar{height:6px;border-radius:2px}
+
+/* ── CHIPS & CONTROLS ────────────────────────────────────────── */
+.toolbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.chips{display:flex;gap:2px;flex-wrap:wrap}
+.chip{
+  padding:6px 10px;border-radius:7px;border:none;background:none;cursor:pointer;
+  font-size:.78rem;font-weight:500;color:var(--muted);
+}
+.chip:hover{color:var(--ink)}
+.chip.active{background:var(--soft);color:var(--ink);box-shadow:inset 0 0 0 1px var(--line)}
+.search{
   display:flex;align-items:center;gap:7px;
-  padding:7px 12px;
-  border:1px solid var(--border);
-  border-radius:7px;
-  font-family:var(--font-b);
-  font-size:.78rem;
-  font-weight:500;
-  color:var(--muted);
-  background:var(--bg);
-  cursor:pointer;
-  transition:all .15s;
-  white-space:nowrap;
+  padding:6px 10px;border:1px solid var(--line-2);border-radius:8px;
+  color:var(--subtle);min-width:200px;
 }
-.toggle-btn.active{background:var(--purple-l);border-color:var(--purple);color:var(--purple)}
-.filter-count{
-  font-size:.75rem;
-  color:var(--muted);
-  white-space:nowrap;
-  margin-left:auto;
+.search input{border:none;outline:none;font-size:.8rem;color:var(--ink);background:none;width:100%}
+.search:focus-within{border-color:var(--ink)}
+.select{
+  padding:6px 26px 6px 10px;border:1px solid var(--line-2);border-radius:8px;
+  font-size:.78rem;color:var(--text);background:var(--surface);cursor:pointer;outline:none;
+  appearance:none;-webkit-appearance:none;max-width:200px;
+  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='10' viewBox='0 0 24 24' fill='none' stroke='%236E6E73' stroke-width='2.4'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");
+  background-repeat:no-repeat;background-position:right 9px center;
 }
+.select:focus{border-color:var(--ink)}
+.switch{display:inline-flex;align-items:center;gap:8px;font-size:.78rem;color:var(--muted);cursor:pointer;user-select:none}
+.switch input{display:none}
+.switch .track{width:28px;height:16px;border-radius:10px;background:var(--line-2);position:relative;transition:background .15s}
+.switch .track::after{
+  content:'';position:absolute;top:2px;left:2px;width:12px;height:12px;border-radius:50%;
+  background:#fff;box-shadow:0 1px 2px rgba(0,0,0,.2);transition:transform .15s;
+}
+.switch input:checked + .track{background:var(--ink)}
+.switch input:checked + .track::after{transform:translateX(12px)}
+.switch input:checked ~ .lbl{color:var(--ink)}
+.spacer{flex:1}
+
+/* ── LINE CHART ──────────────────────────────────────────────── */
+.chart-axis-cap{font-size:.7rem;color:var(--subtle);margin-bottom:6px}
+.chart-box{position:relative;height:250px}
+.legend{display:flex;gap:16px;flex-wrap:wrap;margin-top:14px}
+.legend label{display:inline-flex;align-items:center;gap:7px;font-size:.78rem;color:var(--text);cursor:pointer;user-select:none}
+.legend input{display:none}
+.legend .box{
+  width:15px;height:15px;border-radius:4px;display:grid;place-items:center;
+  border:1.5px solid currentColor;
+}
+.legend .box svg{width:10px;height:10px;stroke:#fff;stroke-width:3;fill:none;opacity:0}
+.legend input:checked + .box{background:currentColor}
+.legend input:checked + .box svg{opacity:1}
+.legend input:not(:checked) ~ .name{color:var(--subtle)}
+
+/* ── STACKED LIST (dept / roles) ─────────────────────────────── */
+.dept-row{padding:12px 0;border-top:1px solid var(--line)}
+.dept-row:first-of-type{border-top:none;padding-top:0}
+.dept-row-head{display:flex;justify-content:space-between;align-items:baseline;gap:10px;margin-bottom:8px}
+.dept-name{font-size:.82rem;font-weight:500;color:var(--ink)}
+.dept-pct{font-size:.82rem;font-weight:700;color:var(--ink)}
+.dept-pct span{font-weight:400;color:var(--muted);font-size:.72rem;margin-left:4px}
+.stack{display:flex;gap:2px;height:8px}
+.stack i{height:100%;border-radius:1px}
+.stack-legend{display:flex;gap:14px;margin-top:14px;font-size:.72rem;color:var(--muted);flex-wrap:wrap}
+.stack-legend span{display:inline-flex;align-items:center;gap:6px}
+.sq{width:8px;height:8px;border-radius:2px;display:inline-block}
+
+.seg{display:flex;gap:3px;height:7px;margin-bottom:16px}
+.seg i{height:100%;border-radius:2px}
+.list-row{display:grid;grid-template-columns:auto 1fr auto auto;gap:10px;align-items:center;padding:6px 0;font-size:.8rem}
+.list-row .name{color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.list-row .v{font-weight:600;color:var(--ink);text-align:right;min-width:52px}
+.list-row .p{color:var(--muted);text-align:right;min-width:40px}
 
 /* ── TABLE ───────────────────────────────────────────────────── */
-.table-wrap{
-  background:var(--surface);
-  border-radius:var(--radius);
-  box-shadow:var(--shadow);
-  border:1px solid var(--border);
-  overflow:hidden;
-}
+.table-scroll{overflow-x:auto;margin:0 -4px}
 table{width:100%;border-collapse:collapse;font-size:.8rem}
-thead{background:#F8FAFC}
 th{
-  padding:11px 14px;
-  text-align:left;
-  font-size:.67rem;
-  font-weight:600;
-  text-transform:uppercase;
-  letter-spacing:.07em;
-  color:var(--muted);
-  border-bottom:1px solid var(--border);
-  cursor:pointer;
-  white-space:nowrap;
-  user-select:none;
+  text-align:left;padding:10px 10px;
+  font-size:.74rem;font-weight:600;color:var(--ink);
+  border-bottom:1px solid var(--line);
+  white-space:nowrap;user-select:none;
 }
-th:hover{color:var(--text)}
-th .sort-arrow{opacity:.4;margin-left:3px;font-size:.7rem}
-th.sort-asc .sort-arrow::after{content:'↑';opacity:1}
-th.sort-desc .sort-arrow::after{content:'↓';opacity:1}
-td{
-  padding:10px 14px;
-  border-bottom:1px solid #F1F5F9;
-  vertical-align:middle;
-  color:var(--text);
+th[data-col]{cursor:pointer}
+th[data-col]:hover{color:var(--muted)}
+th .arrow{display:inline-block;margin-left:4px;font-size:.62rem;color:var(--subtle)}
+th.sort-asc .arrow::after{content:'▲';color:var(--ink)}
+th.sort-desc .arrow::after{content:'▼';color:var(--ink)}
+td{padding:9px 10px;border-bottom:1px solid var(--line);color:var(--text);white-space:nowrap;vertical-align:middle}
+tbody tr:last-child td{border-bottom:none}
+tbody tr:hover td{background:var(--hover)}
+.r{text-align:right}
+.c{text-align:center}
+
+.who{display:flex;align-items:center;gap:10px}
+.avatar{
+  width:24px;height:24px;border-radius:6px;display:grid;place-items:center;
+  font-size:.62rem;font-weight:700;color:#fff;flex-shrink:0;
 }
-tr:last-child td{border-bottom:none}
-tr:hover td{background:#FAFBFD}
+.who b{font-weight:600;color:var(--ink)}
 
-.faixa-badge{
-  display:inline-flex;align-items:center;
-  padding:3px 10px;
-  border-radius:20px;
-  font-size:.68rem;
-  font-weight:600;
-  letter-spacing:.04em;
+.badge{
+  display:inline-flex;align-items:center;gap:6px;
+  padding:3px 9px 3px 7px;border-radius:6px;
+  font-size:.72rem;font-weight:500;color:var(--text);background:var(--soft);
+  box-shadow:inset 0 0 0 1px var(--line);
 }
-.faixa-Alto{background:var(--red-l);color:var(--red)}
-.faixa-Medio{background:var(--amber-l);color:var(--amber)}
-.faixa-Baixo{background:var(--green-l);color:var(--green)}
+.dot{width:7px;height:7px;border-radius:2px;display:inline-block;flex-shrink:0}
 
-.prob-bar-wrap{display:flex;align-items:center;gap:8px;min-width:90px}
-.prob-bar-bg{flex:1;height:5px;background:#E2E8F0;border-radius:3px;overflow:hidden}
-.prob-bar-fill{height:100%;border-radius:3px;transition:width .3s}
+.prob{display:flex;align-items:center;gap:10px;min-width:130px}
+.prob b{font-weight:600;color:var(--ink);min-width:42px}
+.prob .track{flex:1;height:5px;background:var(--line);border-radius:2px;overflow:hidden}
+.prob .track i{display:block;height:100%;border-radius:2px}
 
-.sat-dots{display:flex;gap:3px}
-.dot{width:8px;height:8px;border-radius:50%}
-.dot.filled-1{background:var(--red)}
-.dot.filled-2{background:var(--amber)}
-.dot.filled-3{background:var(--amber)}
-.dot.filled-4{background:var(--green)}
-.dot.empty{background:#E2E8F0}
+.sat{display:flex;gap:2px}
+.sat i{width:9px;height:7px;border-radius:1px;background:var(--line-2)}
 
-.acao-pill{
-  font-size:.65rem;font-weight:600;
-  padding:3px 8px;border-radius:20px;
-  background:var(--purple-l);color:var(--purple);
-  white-space:nowrap;
+.pill{
+  display:inline-flex;align-items:center;gap:5px;
+  padding:3px 9px;border-radius:6px;
+  font-size:.7rem;font-weight:600;background:var(--ink);color:#fff;
 }
 
-/* pagination */
-.pagination{
-  display:flex;align-items:center;justify-content:space-between;
-  padding:12px 18px;
-  background:var(--surface);
-  border:1px solid var(--border);
-  border-top:none;
-  border-radius:0 0 var(--radius) var(--radius);
-  font-size:.78rem;color:var(--muted);
+.table-foot{
+  display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;
+  padding-top:14px;font-size:.76rem;color:var(--muted);
 }
-.page-btns{display:flex;gap:4px}
-.page-btn{
-  padding:5px 10px;border-radius:6px;border:1px solid var(--border);
-  background:var(--bg);color:var(--muted);cursor:pointer;font-size:.78rem;font-family:var(--font-b);
-  transition:all .15s;
+.pager{display:flex;align-items:center;gap:8px}
+.pager .cur{
+  min-width:28px;padding:4px 8px;border:1px solid var(--line-2);border-radius:7px;
+  text-align:center;color:var(--ink);font-weight:500;
 }
-.page-btn:hover{background:var(--blue-l);border-color:var(--blue);color:var(--blue)}
-.page-btn.active{background:var(--blue);border-color:var(--blue);color:#fff}
-.page-btn:disabled{opacity:.4;cursor:default}
+.icon-btn{
+  width:28px;height:28px;border-radius:7px;border:none;background:none;cursor:pointer;
+  display:grid;place-items:center;color:var(--ink);
+}
+.icon-btn:hover{background:var(--soft)}
+.icon-btn:disabled{color:var(--subtle);cursor:default;background:none}
+.link{
+  display:inline-flex;align-items:center;gap:6px;border:none;background:none;cursor:pointer;
+  font-size:.78rem;font-weight:500;color:var(--ink);
+}
+.link:hover{text-decoration:underline}
+.empty{text-align:center;padding:36px 10px;color:var(--subtle)}
 
 /* ── ACIONÁVEIS ──────────────────────────────────────────────── */
-.action-banner{
-  background:linear-gradient(135deg,var(--navy) 0%,var(--navy2) 100%);
-  border-radius:var(--radius);
-  padding:20px 24px;
-  display:flex;align-items:center;gap:16px;
-  margin-bottom:20px;
-  box-shadow:var(--shadow-md);
+.dept-block{padding:22px 26px;border-bottom:1px solid var(--line)}
+.dept-block:last-child{border-bottom:none}
+.dept-block-head{display:flex;align-items:center;gap:10px;margin-bottom:14px}
+.dept-block-head .count{font-size:.74rem;color:var(--muted)}
+.cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:10px}
+.card{
+  border:1px solid var(--line);border-radius:11px;padding:14px 15px;
+  transition:border-color .15s,box-shadow .15s;
 }
-.action-banner-icon{font-size:1.8rem}
-.action-banner-text h3{
-  font-family:var(--font-d);
-  font-size:1.1rem;
-  color:#fff;
-  font-weight:600;
-  margin-bottom:3px;
-}
-.action-banner-text p{font-size:.8rem;color:rgba(255,255,255,.55)}
-.action-banner-stat{
-  margin-left:auto;
-  text-align:right;
-}
-.action-banner-stat .big{font-family:var(--font-d);font-size:2rem;font-weight:700;color:#fff}
-.action-banner-stat .lbl{font-size:.68rem;color:rgba(255,255,255,.5);text-transform:uppercase;letter-spacing:.08em}
+.card:hover{border-color:var(--line-2);box-shadow:0 6px 18px -10px rgba(20,20,20,.18)}
+.card-top{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
+.card-id{font-size:.72rem;color:var(--muted)}
+.card-prob{font-size:1.05rem;font-weight:700;color:var(--ink);display:flex;align-items:center;gap:6px}
+.card-role{font-size:.85rem;font-weight:600;color:var(--ink)}
+.card-meta{font-size:.72rem;color:var(--muted);margin-top:2px}
+.card .prob .track{margin:10px 0 0}
+.factors{display:flex;flex-wrap:wrap;gap:4px;margin-top:12px}
+.factor{font-size:.68rem;padding:3px 7px;border-radius:5px;background:var(--soft);color:var(--muted);font-weight:500}
+.more{margin-top:12px}
 
-.dept-section{margin-bottom:28px}
-.dept-section-title{
-  font-size:.75rem;
-  font-weight:600;
-  text-transform:uppercase;
-  letter-spacing:.1em;
-  color:var(--muted);
-  padding:6px 0;
-  margin-bottom:12px;
-  border-bottom:2px solid var(--border);
-  display:flex;align-items:center;gap:8px;
-}
-.dept-section-title .count-badge{
-  background:var(--red-l);color:var(--red);
-  font-size:.65rem;padding:2px 8px;border-radius:20px;
+.page-foot{
+  display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;
+  max-width:1320px;margin:14px auto 0;padding:0 4px;
+  font-size:.72rem;color:var(--muted);
 }
 
-.action-cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:12px}
-.action-card{
-  background:var(--surface);
-  border-radius:var(--radius);
-  padding:16px;
-  box-shadow:var(--shadow);
-  border:1px solid var(--border);
-  border-left:4px solid var(--red);
-}
-.action-card.faixa-Medio{border-left-color:var(--amber)}
-.action-card-header{
-  display:flex;align-items:flex-start;justify-content:space-between;
-  margin-bottom:10px;
-}
-.action-card-id{font-size:.7rem;color:var(--muted);margin-bottom:2px}
-.action-card-role{font-size:.85rem;font-weight:600;color:var(--text)}
-.action-card-dept{font-size:.72rem;color:var(--muted)}
-.action-card-prob{
-  font-family:var(--font-d);
-  font-size:1.3rem;
-  font-weight:700;
-  line-height:1;
-}
-.action-card-prob.Alto{color:var(--red)}
-.action-card-prob.Medio{color:var(--amber)}
-.action-card-factors{display:flex;flex-wrap:wrap;gap:5px}
-.factor-tag{
-  font-size:.65rem;
-  padding:3px 8px;
-  border-radius:20px;
-  background:#F1F5F9;
-  color:var(--muted);
-  font-weight:500;
-}
-
-/* ── EMPTY STATE ─────────────────────────────────────────────── */
-.empty-state{
-  text-align:center;padding:40px 20px;color:var(--muted);
-}
-.empty-state p{margin-top:8px;font-size:.85rem}
-
-/* ── SCROLLBAR ───────────────────────────────────────────────── */
-::-webkit-scrollbar{width:6px}
+::-webkit-scrollbar{width:8px;height:8px}
 ::-webkit-scrollbar-track{background:transparent}
-::-webkit-scrollbar-thumb{background:#CBD5E1;border-radius:3px}
+::-webkit-scrollbar-thumb{background:#D4D4D0;border-radius:4px}
 
-@media(max-width:1024px){
-  .kpi-grid{grid-template-columns:repeat(2,1fr)}
-  .charts-row{grid-template-columns:1fr}
+@media(max-width:1100px){
+  .grid{grid-template-columns:1fr}
+  .col + .col{border-left:none;border-top:1px solid var(--line)}
 }
-@media(max-width:768px){
-  .sidebar{display:none}
-  .main{margin-left:0;padding:20px 16px 40px}
+@media(max-width:760px){
+  body{padding:0}
+  .app{border-radius:0}
+  .topbar{grid-template-columns:1fr auto;height:auto;padding:12px 16px 0;row-gap:4px}
+  .tabs{grid-column:1 / -1;grid-row:2;overflow-x:auto;height:46px;margin:0 -8px}
+  .subbar{padding:9px 16px}
+  .panel,.dept-block{padding:20px 16px}
+  .kpis{grid-template-columns:1fr;gap:18px}
+  .kpi{padding:0 !important;border-left:none !important}
+  .split{grid-template-columns:1fr}
+  .split .panel + .panel{border-left:none;border-top:1px solid var(--line)}
+  .search{min-width:0;flex:1 1 100%}
+  .page-foot{padding:0 16px 20px}
 }
 </style>
 </head>
 <body>
 
-<!-- ═══════════════════ SIDEBAR ═══════════════════ -->
-<aside class="sidebar">
-  <div class="sidebar-header">
-    <div class="sidebar-logo">
-      Attrition Risk
-      <span>HR Business Partner</span>
+<div class="app">
+
+  <!-- ═══════════════════ TOP BAR ═══════════════════ -->
+  <header class="topbar">
+    <div class="brand">
+      <div class="brand-mark">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19h16"/><path d="M7 15l4-5 3 3 4-6"/></svg>
+      </div>
+      <div>Attrition Risk<small>HR Business Partner</small></div>
     </div>
-  </div>
-
-  <nav class="sidebar-nav">
-    <div class="nav-label">Navegação</div>
-    <a class="nav-item active" href="#painel" onclick="setActive(this)">
-      <span class="nav-icon">📊</span> Painel Geral
-    </a>
-    <a class="nav-item" href="#colaboradores" onclick="setActive(this)">
-      <span class="nav-icon">👥</span> Colaboradores
-    </a>
-    <a class="nav-item" href="#acoes" onclick="setActive(this)">
-      <span class="nav-icon">🎯</span> Acionáveis
-    </a>
-
-    <div class="nav-label" style="margin-top:16px">Alertas</div>
-    <div style="padding:0 6px">
-      <div class="stat-mini">
-        <div class="stat-mini-label">Alto Risco</div>
-        <div class="stat-mini-val" id="sb-alto">—</div>
-        <div class="stat-mini-sub">colaboradores</div>
-      </div>
-      <div class="stat-mini">
-        <div class="stat-mini-label">Com Ação</div>
-        <div class="stat-mini-val" id="sb-acao">—</div>
-        <div class="stat-mini-sub">conversas recomendadas</div>
-      </div>
-    </div>
-  </nav>
-
-  <div class="sidebar-stats" style="padding-bottom:24px">
-    <div style="font-size:.65rem;color:rgba(255,255,255,.25);text-align:center">
-      Dados: attrition_risk_ranking.csv<br>
-      Modelo: XGBoost regularizado<br>
-      Threshold: t = 0.35
-    </div>
-  </div>
-</aside>
-
-<!-- ═══════════════════ MAIN ═══════════════════ -->
-<main class="main">
-
-  <!-- ── PAINEL GERAL ── -->
-  <section class="section" id="painel">
-    <div class="section-title">Painel Geral</div>
-    <div class="section-sub">Visão consolidada de risco de attrition por colaborador ativo</div>
-
-    <div class="kpi-grid">
-      <div class="kpi-card kpi-total">
-        <div class="kpi-label">Total Ativos</div>
-        <div class="kpi-value" id="k-total">—</div>
-        <div class="kpi-desc">colaboradores no ranking</div>
-      </div>
-      <div class="kpi-card kpi-alto">
-        <div class="kpi-label">Alto Risco</div>
-        <div class="kpi-value" id="k-alto">—</div>
-        <div class="kpi-desc">probabilidade ≥ 70%</div>
-      </div>
-      <div class="kpi-card kpi-medio">
-        <div class="kpi-label">Risco Médio</div>
-        <div class="kpi-value" id="k-medio">—</div>
-        <div class="kpi-desc">probabilidade 35–70%</div>
-      </div>
-      <div class="kpi-card kpi-acao">
-        <div class="kpi-label">Ação Recomendada</div>
-        <div class="kpi-value" id="k-acao">—</div>
-        <div class="kpi-desc">prob ≥ 35% · conversa preventiva</div>
-      </div>
-    </div>
-
-    <div class="charts-row">
-      <!-- Donut -->
-      <div class="chart-card">
-        <div class="chart-title">Distribuição de Risco</div>
-        <div class="donut-wrap">
-          <canvas id="donutChart"></canvas>
-        </div>
-        <div class="donut-legend" id="donut-legend"></div>
-      </div>
-
-      <!-- Dept stacked bar -->
-      <div class="chart-card">
-        <div class="chart-title">Risco por Departamento</div>
-        <canvas id="deptChart" height="160"></canvas>
-      </div>
-    </div>
-
-    <!-- Role horizontal bar -->
-    <div class="role-card">
-      <div class="chart-title">Top Cargos — Probabilidade Média de Saída (%)</div>
-      <canvas id="roleChart" height="120"></canvas>
-    </div>
-  </section>
-
-  <!-- ── COLABORADORES ── -->
-  <section class="section" id="colaboradores">
-    <div class="section-title">Colaboradores em Risco</div>
-    <div class="section-sub">Tabela completa com filtros — clique no cabeçalho para ordenar</div>
-
-    <div class="filters-bar">
-      <div class="search-wrap">
-        <span class="search-icon">🔍</span>
-        <input class="search-input" id="search" type="text" placeholder="Buscar por ID, cargo ou departamento…">
-      </div>
-      <select class="filter-select" id="f-dept">
-        <option value="">Todos os depts</option>
-      </select>
-      <select class="filter-select" id="f-role">
-        <option value="">Todos os cargos</option>
-      </select>
-      <select class="filter-select" id="f-faixa">
-        <option value="">Todas as faixas</option>
-        <option value="Alto">Alto Risco</option>
-        <option value="Medio">Risco Médio</option>
-        <option value="Baixo">Baixo Risco</option>
-      </select>
-      <button class="toggle-btn" id="toggle-acao" onclick="toggleAcao()">
-        🎯 Apenas com ação
+    <nav class="tabs">
+      <button class="tab active" data-view="painel">Painel Geral</button>
+      <button class="tab" data-view="colaboradores">Colaboradores</button>
+      <button class="tab" data-view="acoes">Acionáveis</button>
+    </nav>
+    <div class="top-actions">
+      <button class="btn" onclick="exportCsv()" title="Exporta a lista filtrada da aba Colaboradores">
+        <svg class="i" viewBox="0 0 24 24"><path d="M12 4v11"/><path d="M7 10l5 5 5-5"/><path d="M5 20h14"/></svg>
+        Exportar CSV
       </button>
-      <div class="filter-count" id="filter-count"></div>
     </div>
+  </header>
 
-    <div class="table-wrap">
-      <table>
-        <thead>
-          <tr>
-            <th onclick="sortBy(\'id\')" data-col="id">ID<span class="sort-arrow"></span></th>
-            <th onclick="sortBy(\'dept\')" data-col="dept">Departamento<span class="sort-arrow"></span></th>
-            <th onclick="sortBy(\'role\')" data-col="role">Cargo<span class="sort-arrow"></span></th>
-            <th onclick="sortBy(\'level\')" data-col="level">Nível<span class="sort-arrow"></span></th>
-            <th onclick="sortBy(\'prob\')" data-col="prob">Prob. Saída<span class="sort-arrow"></span></th>
-            <th onclick="sortBy(\'faixa\')" data-col="faixa">Faixa<span class="sort-arrow"></span></th>
-            <th>Satisfação</th>
-            <th>Ação</th>
-          </tr>
-        </thead>
-        <tbody id="table-body"></tbody>
-      </table>
-    </div>
-    <div class="pagination">
-      <div id="page-info"></div>
-      <div class="page-btns" id="page-btns"></div>
+  <div class="subbar">
+    <span>
+      <svg class="i" viewBox="0 0 24 24"><rect x="4" y="5" width="16" height="15" rx="2"/><path d="M4 10h16M9 3v4M15 3v4"/></svg>
+      Base: <b id="sub-total">—</b> colaboradores ativos
+    </span>
+    <span>
+      <svg class="i" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/><path d="M12 8v4l3 2"/></svg>
+      Modelo: <b>XGBoost regularizado</b> · threshold <b>t = 0.35</b>
+    </span>
+  </div>
+
+  <!-- ═══════════════════ PAINEL GERAL ═══════════════════ -->
+  <section class="view active" id="view-painel">
+    <div class="grid">
+      <div class="col">
+
+        <div class="panel">
+          <div class="panel-head"><div class="panel-title">Risco de saída</div></div>
+          <div class="kpis">
+            <div class="kpi">
+              <div class="eyebrow">Colaboradores ativos</div>
+              <div class="num" id="k-total">—</div>
+              <div class="kpi-viz">
+                <span class="marker" style="left:35%" title="Threshold t = 0.35"></span>
+                <div class="barcode" id="barcode"></div>
+              </div>
+            </div>
+            <div class="kpi">
+              <div class="eyebrow">Probabilidade média</div>
+              <div class="num" id="k-media">—</div>
+              <div class="kpi-viz">
+                <div class="gauge-wrap">
+                  <span class="marker" id="gauge-marker"></span>
+                  <div class="gauge" id="gauge"></div>
+                </div>
+              </div>
+            </div>
+            <div class="kpi">
+              <div class="eyebrow">Ação recomendada</div>
+              <div class="num"><span id="k-acao">—</span><span class="delta" id="k-acao-pct"></span></div>
+              <div class="kpi-viz">
+                <div class="meter"><i id="acao-meter"></i></div>
+                <div class="meter-cap"><span>prob ≥ 35%</span><span>conversa preventiva</span></div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-head">
+            <div>
+              <div class="panel-title">Risco por tempo de casa</div>
+              <div class="panel-sub">Probabilidade média de saída por anos na empresa, por departamento</div>
+            </div>
+          </div>
+          <div class="chart-axis-cap">Prob. média de saída, %</div>
+          <div class="chart-box"><canvas id="tenureChart"></canvas></div>
+          <div class="legend" id="tenure-legend"></div>
+        </div>
+
+        <div class="split">
+          <div class="panel">
+            <div class="panel-head">
+              <div>
+                <div class="panel-title">Por departamento</div>
+                <div class="panel-sub" id="dept-insight"></div>
+              </div>
+            </div>
+            <div id="dept-list"></div>
+            <div class="stack-legend">
+              <span><i class="sq" style="background:var(--alto)"></i>Alto</span>
+              <span><i class="sq" style="background:var(--medio)"></i>Médio</span>
+              <span><i class="sq" style="background:var(--line-2)"></i>Baixo</span>
+            </div>
+          </div>
+          <div class="panel">
+            <div class="panel-head">
+              <div>
+                <div class="panel-title">Cargos em risco</div>
+                <div class="panel-sub">Participação nas conversas recomendadas</div>
+              </div>
+            </div>
+            <div class="seg" id="role-seg"></div>
+            <div id="role-list"></div>
+          </div>
+        </div>
+
+      </div>
+      <div class="col">
+
+        <div class="panel">
+          <div class="panel-head"><div class="panel-title">Distribuição por faixa</div></div>
+          <div class="dist" id="dist"></div>
+        </div>
+
+        <div class="panel">
+          <div class="toolbar" style="margin-bottom:10px">
+            <div class="chips" id="top-chips">
+              <button class="chip active" data-f="">Todos</button>
+              <button class="chip" data-f="Alto">Alto</button>
+              <button class="chip" data-f="Medio">Médio</button>
+            </div>
+            <div class="spacer"></div>
+            <span class="eyebrow">Maiores probabilidades</span>
+          </div>
+          <div class="table-scroll">
+            <table>
+              <thead><tr><th>Colaborador</th><th>Cargo</th><th>Faixa</th><th class="r">Prob.</th></tr></thead>
+              <tbody id="top-body"></tbody>
+            </table>
+          </div>
+          <div class="table-foot">
+            <span>Top 12 de <b id="top-count" style="color:var(--ink);font-weight:500">—</b></span>
+            <button class="link" onclick="goTo('colaboradores')">
+              Ver todos os colaboradores
+              <svg class="i" viewBox="0 0 24 24"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
+            </button>
+          </div>
+        </div>
+
+      </div>
     </div>
   </section>
 
-  <!-- ── ACIONÁVEIS ── -->
-  <section class="section" id="acoes">
-    <div class="section-title">Acionáveis</div>
-    <div class="section-sub">Colaboradores com conversa preventiva recomendada, agrupados por departamento</div>
-
-    <div class="action-banner">
-      <div class="action-banner-icon">🎯</div>
-      <div class="action-banner-text">
-        <h3>Protocolo de Retenção Ativa</h3>
-        <p>Agende 1:1 com cada colaborador listado — threshold t = 0.35 garante ~90% de recall com custo de apenas uma conversa</p>
+  <!-- ═══════════════════ COLABORADORES ═══════════════════ -->
+  <section class="view" id="view-colaboradores">
+    <div class="panel">
+      <div class="panel-head">
+        <div>
+          <div class="panel-title">Colaboradores</div>
+          <div class="panel-sub">Clique no cabeçalho para ordenar · <span id="filter-count"></span></div>
+        </div>
       </div>
-      <div class="action-banner-stat">
-        <div class="big" id="banner-total">—</div>
-        <div class="lbl">colaboradores</div>
+      <div class="toolbar" style="margin-bottom:12px">
+        <div class="chips" id="faixa-chips">
+          <button class="chip active" data-f="">Todos</button>
+          <button class="chip" data-f="Alto">Alto risco</button>
+          <button class="chip" data-f="Medio">Risco médio</button>
+          <button class="chip" data-f="Baixo">Baixo risco</button>
+        </div>
+        <select class="select" id="f-dept"><option value="">Todos os departamentos</option></select>
+        <select class="select" id="f-role"><option value="">Todos os cargos</option></select>
+        <label class="switch">
+          <input type="checkbox" id="f-acao"><span class="track"></span><span class="lbl">Apenas com ação</span>
+        </label>
+        <div class="spacer"></div>
+        <label class="search">
+          <svg class="i" viewBox="0 0 24 24"><circle cx="11" cy="11" r="6"/><path d="M20 20l-4.5-4.5"/></svg>
+          <input id="search" type="text" placeholder="Buscar ID, cargo ou depto…">
+        </label>
+      </div>
+      <div class="table-scroll">
+        <table>
+          <thead>
+            <tr>
+              <th data-col="id">Colaborador<span class="arrow"></span></th>
+              <th data-col="dept">Departamento<span class="arrow"></span></th>
+              <th data-col="role">Cargo<span class="arrow"></span></th>
+              <th data-col="level" class="c">Nível<span class="arrow"></span></th>
+              <th data-col="prob">Prob. de saída<span class="arrow"></span></th>
+              <th data-col="faixa">Faixa<span class="arrow"></span></th>
+              <th>Sat. trabalho</th>
+              <th>Ação</th>
+            </tr>
+          </thead>
+          <tbody id="table-body"></tbody>
+        </table>
+      </div>
+      <div class="table-foot">
+        <label style="display:flex;align-items:center;gap:8px">Mostrar
+          <select class="select" id="page-size"><option>10</option><option selected>25</option><option>50</option><option>100</option></select>
+        </label>
+        <div class="pager">
+          <button class="icon-btn" id="prev" aria-label="Página anterior"><svg class="i" viewBox="0 0 24 24"><path d="M15 6l-6 6 6 6"/></svg></button>
+          <span class="cur" id="page-cur">1</span><span>/</span><span id="page-total">1</span>
+          <button class="icon-btn" id="next" aria-label="Próxima página"><svg class="i" viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg></button>
+        </div>
       </div>
     </div>
+  </section>
 
+  <!-- ═══════════════════ ACIONÁVEIS ═══════════════════ -->
+  <section class="view" id="view-acoes">
+    <div class="grid">
+      <div class="col">
+        <div class="panel" style="border-bottom:none">
+          <div class="panel-title">Protocolo de retenção ativa</div>
+          <div class="panel-sub" style="max-width:460px;line-height:1.5">
+            Agende um 1:1 com cada colaborador listado. O threshold t = 0.35 captura ~90% de quem sairia —
+            o custo de um falso alarme é apenas uma conversa.
+          </div>
+        </div>
+      </div>
+      <div class="col">
+        <div class="panel" style="border-bottom:none">
+          <div class="dist" id="acoes-dist"></div>
+        </div>
+      </div>
+    </div>
+    <div style="padding:0 26px 14px;border-bottom:1px solid var(--line)" class="toolbar">
+      <div class="chips" id="acoes-chips"></div>
+    </div>
     <div id="action-sections"></div>
   </section>
 
-</main>
+</div>
+
+<footer class="page-foot">
+  <span>Fonte: attrition_risk_ranking.csv · IBM HR Analytics</span>
+  <span>Faixas: Alto ≥ 70% · Médio ≥ 35% · Baixo &lt; 35%</span>
+</footer>
 
 <script>
 const RAW = %DATA_JSON%;
 const EMPLOYEES = RAW.employees;
-
-// ── populate KPIs ────────────────────────────────────────────────────────────
 const K = RAW.kpis;
-document.getElementById("k-total").textContent = K.total.toLocaleString("pt-BR");
-document.getElementById("k-alto").textContent  = K.alto;
-document.getElementById("k-medio").textContent = K.medio;
-document.getElementById("k-acao").textContent  = K.acao;
-document.getElementById("sb-alto").textContent = K.alto;
-document.getElementById("sb-acao").textContent = K.acao;
-document.getElementById("banner-total").textContent = K.acao;
 
-// ── Donut chart ──────────────────────────────────────────────────────────────
+var css = getComputedStyle(document.documentElement);
+function v(name){ return css.getPropertyValue(name).trim(); }
+var TIER = {
+  Alto:  {label:"Alto",  color:v("--alto")},
+  Medio: {label:"Médio", color:v("--medio")},
+  Baixo: {label:"Baixo", color:v("--baixo")}
+};
+var DEPT_COLORS = [v("--d1"), v("--d2"), v("--d3")];
+var DEPT_COLOR = {};
+RAW.tenure.series.forEach(function(s,i){ DEPT_COLOR[s.dept] = DEPT_COLORS[i]; });
+
+function fmt(n){ return n.toLocaleString("pt-BR"); }
+function pct(n){ return n.toLocaleString("pt-BR",{minimumFractionDigits:1,maximumFractionDigits:1})+"%"; }
+function tierOf(p){ return p>=70?"Alto":p>=35?"Medio":"Baixo"; }
+function initials(s){ return s.split(/[\s&]+/).filter(Boolean).map(function(w){return w[0];}).join("").slice(0,2).toUpperCase(); }
+function avatar(e){ return "<span class='avatar' style='background:"+DEPT_COLOR[e.dept]+"' title='"+e.dept+"'>"+initials(e.dept)+"</span>"; }
+function badge(f){ return "<span class='badge'><i class='dot' style='background:"+TIER[f].color+"'></i>"+TIER[f].label+"</span>"; }
+function probCell(p){
+  return "<div class='prob'><b>"+pct(p)+"</b><span class='track'><i style='width:"+Math.min(100,p)+"%;background:"+TIER[tierOf(p)].color+"'></i></span></div>";
+}
+
+// ── tabs ─────────────────────────────────────────────────────────────────────
+function goTo(view){
+  document.querySelectorAll(".tab").forEach(function(t){ t.classList.toggle("active", t.dataset.view===view); });
+  document.querySelectorAll(".view").forEach(function(s){ s.classList.toggle("active", s.id==="view-"+view); });
+  history.replaceState(null,"","#"+view);
+  window.scrollTo({top:0});
+}
+document.querySelectorAll(".tab").forEach(function(t){
+  t.addEventListener("click", function(){ goTo(t.dataset.view); });
+});
+
+// ── KPIs ─────────────────────────────────────────────────────────────────────
+document.getElementById("sub-total").textContent = fmt(K.total);
+document.getElementById("k-total").textContent   = fmt(K.total);
+document.getElementById("k-media").textContent   = pct(K.prob_media);
+document.getElementById("k-acao").textContent    = fmt(K.acao);
+document.getElementById("k-acao-pct").textContent = pct(K.acao/K.total*100)+" da base";
+document.getElementById("acao-meter").style.width = (K.acao/K.total*100)+"%";
+
 (function(){
-  const D = RAW.donut;
-  const colors = ["#DC2626","#D97706","#16A34A"];
-  new Chart(document.getElementById("donutChart"),{
-    type:"doughnut",
-    data:{
-      labels:D.labels,
-      datasets:[{data:D.values,backgroundColor:colors,borderWidth:0,hoverOffset:4}]
-    },
-    options:{
-      cutout:"70%",
-      plugins:{legend:{display:false},tooltip:{
-        callbacks:{label:function(c){
-          const total=D.values.reduce((a,b)=>a+b,0);
-          return " "+c.raw+" ("+Math.round(c.raw/total*100)+"%)";
-        }}
-      }}
-    }
-  });
-  const legend = document.getElementById("donut-legend");
-  D.labels.forEach(function(lbl,i){
-    const total = D.values.reduce(function(a,b){return a+b;},0);
-    const pct = Math.round(D.values[i]/total*100);
-    legend.innerHTML += "<div class=\\"legend-item\\"><span class=\\"legend-dot\\" style=\\"background:"+colors[i]+"\\"></span>"+lbl+"<span class=\\"legend-val\\">"+D.values[i]+" ("+pct+"%)</span></div>";
-  });
+  var max = Math.max.apply(null, RAW.hist.map(function(h){return h.n;}));
+  document.getElementById("barcode").innerHTML = RAW.hist.map(function(h){
+    var hgt = Math.max(10, Math.sqrt(h.n/max)*100);
+    return "<i style='height:"+hgt+"%;background:"+TIER[tierOf(h.lo)].color+"' title='"
+      +h.lo+"–"+h.hi+"%: "+fmt(h.n)+" colaboradores'></i>";
+  }).join("");
+
+  var segs = [[35,"Baixo"],[35,"Medio"],[30,"Alto"]];
+  document.getElementById("gauge").innerHTML = segs.map(function(s){
+    return "<i style='flex:"+s[0]+";background:"+TIER[s[1]].color+"' title='"+TIER[s[1]].label+"'></i>";
+  }).join("");
+  document.getElementById("gauge-marker").style.left = K.prob_media+"%";
 })();
 
-// ── Dept stacked bar ─────────────────────────────────────────────────────────
+// ── distribution (invoices-style) ────────────────────────────────────────────
+function renderDist(el, parts){
+  var total = parts.reduce(function(a,p){return a+p.n;},0);
+  el.innerHTML = parts.map(function(p){
+    var share = total ? p.n/total*100 : 0;
+    return "<div class='dist-col' style='flex:"+Math.max(share,22)+"'>"
+      +"<div class='dist-meta'><div class='eyebrow'>"+p.label+"</div>"
+      +"<div class='num num-lg'>"+fmt(p.n)+"</div>"
+      +"<div class='dist-pct'>"+pct(share)+"</div></div>"
+      +"<div class='dist-bar' style='background:"+p.color+"'></div></div>";
+  }).join("");
+}
+renderDist(document.getElementById("dist"), [
+  {label:"Alto risco",  n:K.alto,  color:TIER.Alto.color},
+  {label:"Risco médio", n:K.medio, color:TIER.Medio.color},
+  {label:"Baixo risco", n:K.baixo, color:TIER.Baixo.color}
+]);
+
+// ── tenure line chart ────────────────────────────────────────────────────────
 (function(){
-  const D = RAW.dept_data;
-  new Chart(document.getElementById("deptChart"),{
-    type:"bar",
-    data:{
-      labels:D.map(function(d){return d.dept}),
-      datasets:[
-        {label:"Alto",data:D.map(function(d){return d.alto}),backgroundColor:"#DC2626",borderRadius:3},
-        {label:"Médio",data:D.map(function(d){return d.medio}),backgroundColor:"#D97706",borderRadius:3},
-        {label:"Baixo",data:D.map(function(d){return d.baixo}),backgroundColor:"#86EFAC",borderRadius:3}
-      ]
-    },
+  var T = RAW.tenure;
+  var ink = v("--ink"), muted = v("--muted"), line = v("--line");
+  var font = {family:"Inter", size:11};
+
+  var crosshair = {
+    id:"crosshair",
+    afterDraw:function(chart){
+      var act = chart.tooltip && chart.tooltip.getActiveElements();
+      if(!act || !act.length) return;
+      var x = act[0].element.x, a = chart.chartArea, ctx = chart.ctx;
+      ctx.save(); ctx.setLineDash([3,3]); ctx.strokeStyle = muted; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(x,a.top); ctx.lineTo(x,a.bottom); ctx.stroke(); ctx.restore();
+    }
+  };
+  var threshold = {
+    id:"threshold",
+    beforeDatasetsDraw:function(chart){
+      var y = chart.scales.y.getPixelForValue(35), a = chart.chartArea, ctx = chart.ctx;
+      if(y < a.top || y > a.bottom) return;
+      ctx.save(); ctx.setLineDash([4,4]); ctx.strokeStyle = TIER.Medio.color; ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.moveTo(a.left,y); ctx.lineTo(a.right,y); ctx.stroke();
+      ctx.setLineDash([]); ctx.fillStyle = muted; ctx.font = "500 10px Inter";
+      ctx.textAlign = "right"; ctx.fillText("t = 35%", a.right-2, y-5); ctx.restore();
+    }
+  };
+
+  var datasets = T.series.map(function(s,i){
+    var c = DEPT_COLOR[s.dept];
+    return {
+      label:s.dept, data:s.values, n:s.n,
+      borderColor:c, backgroundColor:c, borderWidth:2,
+      pointRadius:0, pointHoverRadius:4, pointHoverBorderColor:"#fff", pointHoverBorderWidth:2,
+      tension:0, spanGaps:true,
+      fill: i===0 ? {target:"origin"} : false
+    };
+  });
+
+  var chart = new Chart(document.getElementById("tenureChart"),{
+    type:"line",
+    data:{labels:T.labels, datasets:datasets},
+    plugins:[crosshair, threshold],
     options:{
-      responsive:true,
-      plugins:{legend:{position:"top",labels:{font:{family:"DM Sans",size:11},boxWidth:10}}},
+      responsive:true, maintainAspectRatio:false,
+      interaction:{mode:"index", intersect:false},
+      plugins:{
+        legend:{display:false},
+        filler:{propagate:false},
+        tooltip:{
+          backgroundColor:"#fff", titleColor:muted, bodyColor:ink,
+          borderColor:v("--line-2"), borderWidth:1, padding:10, cornerRadius:8,
+          titleFont:{family:"Inter", size:10, weight:"500"}, bodyFont:{family:"Inter", size:12},
+          boxWidth:8, boxHeight:8, boxPadding:5, usePointStyle:true,
+          callbacks:{
+            title:function(items){ var l = items[0].label; return (l==="1"?"1 ano":l+" anos")+" de casa"; },
+            label:function(c){
+              if(c.raw===null) return null;
+              return " "+c.dataset.label+":  "+pct(c.raw)+"  (n="+c.dataset.n[c.dataIndex]+")";
+            },
+            labelPointStyle:function(){ return {pointStyle:"rectRounded", rotation:0}; }
+          }
+        }
+      },
       scales:{
-        x:{stacked:true,grid:{display:false},ticks:{font:{family:"DM Sans",size:11}}},
-        y:{stacked:true,grid:{color:"#F1F5F9"},ticks:{font:{family:"DM Sans",size:11}}}
+        x:{grid:{display:false}, border:{display:false}, ticks:{font:font, color:muted},
+           title:{display:true, text:"Anos na empresa", font:font, color:muted}},
+        y:{grid:{color:line}, border:{display:false, dash:[3,3]},
+           suggestedMin:20, suggestedMax:60,
+           ticks:{font:font, color:muted, stepSize:10, callback:function(x){return x+"%";}}}
       }
     }
   });
-})();
 
-// ── Role horizontal bar ──────────────────────────────────────────────────────
-(function(){
-  const D = RAW.role_data.slice().reverse();
-  new Chart(document.getElementById("roleChart"),{
-    type:"bar",
-    data:{
-      labels:D.map(function(d){return d.role}),
-      datasets:[{
-        label:"Prob. Média (%)",
-        data:D.map(function(d){return d.avg}),
-        backgroundColor:D.map(function(d){
-          return d.avg>=70?"#DC2626":d.avg>=35?"#D97706":"#16A34A";
-        }),
-        borderRadius:4,
-        barThickness:16
-      }]
-    },
-    options:{
-      indexAxis:"y",
-      responsive:true,
-      plugins:{legend:{display:false},tooltip:{
-        callbacks:{label:function(c){return " "+c.raw+"% média";}}
-      }},
-      scales:{
-        x:{grid:{color:"#F1F5F9"},max:100,ticks:{callback:function(v){return v+"%"},font:{family:"DM Sans",size:10}}},
-        y:{grid:{display:false},ticks:{font:{family:"DM Sans",size:11}}}
-      }
-    }
+  // gradient fill under the first series
+  var ctx = chart.ctx, area = chart.chartArea;
+  var g = ctx.createLinearGradient(0, area.top, 0, area.bottom);
+  g.addColorStop(0, DEPT_COLORS[0]+"22"); g.addColorStop(1, DEPT_COLORS[0]+"00");
+  chart.data.datasets[0].backgroundColor = g;
+  chart.update("none");
+
+  var tick = "<svg viewBox='0 0 24 24'><path d='M5 12l5 5 9-10'/></svg>";
+  document.getElementById("tenure-legend").innerHTML = T.series.map(function(s,i){
+    return "<label style='color:"+DEPT_COLOR[s.dept]+"'><input type='checkbox' checked data-i='"+i+"'>"
+      +"<span class='box'>"+tick+"</span><span class='name' style='color:var(--text)'>"+s.dept+"</span></label>";
+  }).join("");
+  document.querySelectorAll("#tenure-legend input").forEach(function(inp){
+    inp.addEventListener("change", function(){
+      chart.setDatasetVisibility(+inp.dataset.i, inp.checked);
+      inp.nextElementSibling.nextElementSibling.style.color = inp.checked ? "var(--text)" : "var(--subtle)";
+      chart.update();
+    });
   });
 })();
+
+// ── departments ──────────────────────────────────────────────────────────────
+(function(){
+  var D = RAW.dept_data;
+  var top = D[0];
+  document.getElementById("dept-insight").textContent =
+    top.dept+" lidera com "+pct(top.pct_risco)+" em risco";
+  document.getElementById("dept-list").innerHTML = D.map(function(d){
+    return "<div class='dept-row'><div class='dept-row-head'>"
+      +"<span class='dept-name'>"+d.dept+"</span>"
+      +"<span class='dept-pct'>"+pct(d.pct_risco)+"<span>"+fmt(d.alto+d.medio)+" de "+fmt(d.total)+"</span></span></div>"
+      +"<div class='stack'>"
+        +"<i style='flex:"+d.alto+";background:"+TIER.Alto.color+"' title='Alto: "+d.alto+"'></i>"
+        +"<i style='flex:"+d.medio+";background:"+TIER.Medio.color+"' title='Médio: "+d.medio+"'></i>"
+        +"<i style='flex:"+d.baixo+";background:var(--line-2)' title='Baixo: "+d.baixo+"'></i>"
+      +"</div></div>";
+  }).join("");
+})();
+
+// ── roles ────────────────────────────────────────────────────────────────────
+(function(){
+  var R = RAW.role_data;
+  var shades = ["#151517","#3A3A3F","#5E5E64","#86868C","#ADADB2","#CFCFD3","#E4E4E7"];
+  var total = R.reduce(function(a,r){return a+r.n_risco;},0);
+  document.getElementById("role-seg").innerHTML = R.map(function(r,i){
+    return "<i style='flex:"+r.n_risco+";background:"+shades[i]+"' title='"+r.role+": "+r.n_risco+"'></i>";
+  }).join("");
+  document.getElementById("role-list").innerHTML = R.map(function(r,i){
+    return "<div class='list-row' title='Prob. média: "+pct(r.avg)+"'>"
+      +"<i class='sq' style='background:"+shades[i]+"'></i>"
+      +"<span class='name'>"+r.role+"</span>"
+      +"<span class='v'>"+fmt(r.n_risco)+"</span>"
+      +"<span class='p'>"+Math.round(r.n_risco/total*100)+"%</span></div>";
+  }).join("");
+})();
+
+// ── top risk mini-table ──────────────────────────────────────────────────────
+function renderTop(f){
+  var rows = EMPLOYEES.filter(function(e){ return f ? e.faixa===f : e.faixa!=="Baixo"; });
+  document.getElementById("top-count").textContent = fmt(rows.length);
+  document.getElementById("top-body").innerHTML = rows.slice(0,12).map(function(e){
+    return "<tr><td><div class='who'>"+avatar(e)+"<b>#"+e.id+"</b></div></td>"
+      +"<td>"+e.role+"</td><td>"+badge(e.faixa)+"</td>"
+      +"<td class='r'><b style='color:var(--ink)'>"+pct(e.prob)+"</b></td></tr>";
+  }).join("");
+}
+document.querySelectorAll("#top-chips .chip").forEach(function(c){
+  c.addEventListener("click", function(){
+    document.querySelectorAll("#top-chips .chip").forEach(function(x){ x.classList.toggle("active", x===c); });
+    renderTop(c.dataset.f);
+  });
+});
+renderTop("");
 
 // ── TABLE ─────────────────────────────────────────────────────────────────────
-var filtered   = EMPLOYEES.slice();
-var sortCol    = "prob";
-var sortDir    = -1;
+var filtered    = EMPLOYEES.slice();
+var sortCol     = "prob";
+var sortDir     = -1;
 var currentPage = 1;
-var PAGE_SIZE   = 25;
-var onlyAcao    = false;
+var faixaFilter = "";
 
-// populate filter dropdowns
 var depts = [...new Set(EMPLOYEES.map(function(e){return e.dept}))].sort();
 var roles = [...new Set(EMPLOYEES.map(function(e){return e.role}))].sort();
-var deptSel = document.getElementById("f-dept");
-var roleSel = document.getElementById("f-role");
 depts.forEach(function(d){
-  var o=document.createElement("option"); o.value=d; o.textContent=d; deptSel.appendChild(o);
+  var o=document.createElement("option"); o.value=d; o.textContent=d; document.getElementById("f-dept").appendChild(o);
 });
 roles.forEach(function(r){
-  var o=document.createElement("option"); o.value=r; o.textContent=r; roleSel.appendChild(o);
+  var o=document.createElement("option"); o.value=r; o.textContent=r; document.getElementById("f-role").appendChild(o);
 });
 
 document.getElementById("search").addEventListener("input", applyFilters);
-document.getElementById("f-dept").addEventListener("change", applyFilters);
-document.getElementById("f-role").addEventListener("change", applyFilters);
-document.getElementById("f-faixa").addEventListener("change", applyFilters);
-
-function toggleAcao(){
-  onlyAcao = !onlyAcao;
-  document.getElementById("toggle-acao").classList.toggle("active", onlyAcao);
-  applyFilters();
-}
+["f-dept","f-role","f-acao"].forEach(function(id){
+  document.getElementById(id).addEventListener("change", applyFilters);
+});
+document.getElementById("page-size").addEventListener("change", function(){ currentPage=1; renderTable(); });
+document.getElementById("prev").addEventListener("click", function(){ currentPage--; renderTable(); });
+document.getElementById("next").addEventListener("click", function(){ currentPage++; renderTable(); });
+document.querySelectorAll("#faixa-chips .chip").forEach(function(c){
+  c.addEventListener("click", function(){
+    document.querySelectorAll("#faixa-chips .chip").forEach(function(x){ x.classList.toggle("active", x===c); });
+    faixaFilter = c.dataset.f;
+    applyFilters();
+  });
+});
+document.querySelectorAll("th[data-col]").forEach(function(th){
+  th.addEventListener("click", function(){ sortBy(th.dataset.col); });
+});
 
 function applyFilters(){
   var q   = document.getElementById("search").value.toLowerCase();
   var dep = document.getElementById("f-dept").value;
   var rol = document.getElementById("f-role").value;
-  var fai = document.getElementById("f-faixa").value;
+  var acao = document.getElementById("f-acao").checked;
 
   filtered = EMPLOYEES.filter(function(e){
     if(q && !(
@@ -898,8 +997,8 @@ function applyFilters(){
     )) return false;
     if(dep && e.dept !== dep) return false;
     if(rol && e.role !== rol) return false;
-    if(fai && e.faixa !== fai) return false;
-    if(onlyAcao && !e.acao) return false;
+    if(faixaFilter && e.faixa !== faixaFilter) return false;
+    if(acao && !e.acao) return false;
     return true;
   });
 
@@ -927,143 +1026,137 @@ function applySort(){
   });
 }
 
-function satDots(val, max){
-  var html="<div class=\\"sat-dots\\">";
-  for(var i=1;i<=max;i++){
-    html += "<span class=\\"dot "+(i<=val?"filled-"+Math.round(val):"empty")+"\\"></span>";
-  }
-  html+="</div>";
-  return html;
+function satBars(val){
+  var c = val<=1?TIER.Alto.color:val<=2?TIER.Medio.color:TIER.Baixo.color;
+  var html = "<div class='sat' title='"+val+" de 4'>";
+  for(var i=1;i<=4;i++) html += "<i"+(i<=val?" style='background:"+c+"'":"")+"></i>";
+  return html+"</div>";
 }
 
 function renderTable(){
+  var size = +document.getElementById("page-size").value;
   var total = filtered.length;
-  var totalPages = Math.max(1, Math.ceil(total/PAGE_SIZE));
-  if(currentPage > totalPages) currentPage = totalPages;
+  var totalPages = Math.max(1, Math.ceil(total/size));
+  currentPage = Math.min(Math.max(1,currentPage), totalPages);
 
-  var start = (currentPage-1)*PAGE_SIZE;
-  var page  = filtered.slice(start, start+PAGE_SIZE);
+  var start = (currentPage-1)*size;
+  var page  = filtered.slice(start, start+size);
 
   var tbody = document.getElementById("table-body");
   if(!page.length){
-    tbody.innerHTML = "<tr><td colspan=\\"8\\" style=\\"text-align:center;padding:32px;color:#94A3B8\\">Nenhum colaborador encontrado</td></tr>";
+    tbody.innerHTML = "<tr><td colspan='8' class='empty'>Nenhum colaborador encontrado</td></tr>";
   } else {
     tbody.innerHTML = page.map(function(e){
-      var probColor = e.prob>=70?"#DC2626":e.prob>=35?"#D97706":"#16A34A";
-      var barW = Math.min(100,e.prob);
       return "<tr>"
-        +"<td><strong>#"+e.id+"</strong></td>"
+        +"<td><div class='who'>"+avatar(e)+"<b>#"+e.id+"</b></div></td>"
         +"<td>"+e.dept+"</td>"
         +"<td>"+e.role+"</td>"
-        +"<td style=\\"text-align:center\\">"+e.level+"</td>"
-        +"<td><div class=\\"prob-bar-wrap\\">"
-          +"<span style=\\"font-weight:600;color:"+probColor+";min-width:38px\\">"
-          +e.prob.toFixed(1)+"%</span>"
-          +"<div class=\\"prob-bar-bg\\"><div class=\\"prob-bar-fill\\" style=\\"width:"+barW+"%;background:"+probColor+"\\"></div></div>"
-          +"</div></td>"
-        +"<td><span class=\\"faixa-badge faixa-"+e.faixa+"\\">"+
-          (e.faixa==="Alto"?"Alto":e.faixa==="Medio"?"Médio":"Baixo")+"</span></td>"
-        +"<td>"+satDots(e.job_sat,4)+"</td>"
-        +"<td>"+(e.acao?"<span class=\\"acao-pill\\">🎯 Conversa</span>":"")+"</td>"
+        +"<td class='c'>"+e.level+"</td>"
+        +"<td>"+probCell(e.prob)+"</td>"
+        +"<td>"+badge(e.faixa)+"</td>"
+        +"<td>"+satBars(e.job_sat)+"</td>"
+        +"<td>"+(e.acao?"<span class='pill'>Conversa</span>":"")+"</td>"
         +"</tr>";
     }).join("");
   }
 
   document.getElementById("filter-count").textContent =
-    total.toLocaleString("pt-BR")+" colaborador"+(total!==1?"es":"");
-
-  // pagination info
-  document.getElementById("page-info").textContent =
-    "Página "+currentPage+" de "+totalPages+" · "+total+" resultado"+(total!==1?"s":"");
-
-  // page buttons
-  var btns = document.getElementById("page-btns");
-  btns.innerHTML="";
-  // prev
-  var prev=document.createElement("button");
-  prev.className="page-btn"; prev.textContent="‹ Ant";
-  prev.disabled=(currentPage===1);
-  prev.onclick=function(){currentPage--;renderTable();};
-  btns.appendChild(prev);
-  // numbered (max 5 around current)
-  var lo=Math.max(1,currentPage-2), hi=Math.min(totalPages,lo+4);
-  for(var p=lo;p<=hi;p++){
-    (function(pg){
-      var b=document.createElement("button");
-      b.className="page-btn"+(pg===currentPage?" active":"");
-      b.textContent=pg;
-      b.onclick=function(){currentPage=pg;renderTable();};
-      btns.appendChild(b);
-    })(p);
-  }
-  // next
-  var nxt=document.createElement("button");
-  nxt.className="page-btn"; nxt.textContent="Próx ›";
-  nxt.disabled=(currentPage===totalPages);
-  nxt.onclick=function(){currentPage++;renderTable();};
-  btns.appendChild(nxt);
+    fmt(total)+" colaborador"+(total!==1?"es":"");
+  document.getElementById("page-cur").textContent = currentPage;
+  document.getElementById("page-total").textContent = totalPages;
+  document.getElementById("prev").disabled = currentPage===1;
+  document.getElementById("next").disabled = currentPage===totalPages;
 }
 
-// initial sort marker
-document.querySelector("th[data-col=\\"prob\\"]").classList.add("sort-desc");
+document.querySelector("th[data-col='prob']").classList.add("sort-desc");
 applyFilters();
+
+// ── CSV export (current table filter) ────────────────────────────────────────
+function exportCsv(){
+  var cols = ["id","dept","role","level","prob","faixa","job_sat","env_sat","wlb","acao"];
+  var lines = [cols.join(";")].concat(filtered.map(function(e){
+    return cols.map(function(c){
+      var x = e[c];
+      if(c==="acao") x = x ? "Conversa recomendada" : "";
+      if(c==="prob") x = String(x).replace(".",",");
+      return '"'+String(x).replace(/"/g,'""')+'"';
+    }).join(";");
+  }));
+  var blob = new Blob(["﻿"+lines.join("\n")], {type:"text/csv;charset=utf-8"});
+  var a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "colaboradores_risco.csv";
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
 
 // ── ACIONÁVEIS ───────────────────────────────────────────────────────────────
 (function(){
   var actionable = EMPLOYEES.filter(function(e){return e.acao;});
+  var nAlto = actionable.filter(function(e){return e.faixa==="Alto";}).length;
+  renderDist(document.getElementById("acoes-dist"), [
+    {label:"Alto risco",  n:nAlto,                   color:TIER.Alto.color},
+    {label:"Risco médio", n:actionable.length-nAlto, color:TIER.Medio.color}
+  ]);
+
   var byDept = {};
-  actionable.forEach(function(e){
-    if(!byDept[e.dept]) byDept[e.dept]=[];
-    byDept[e.dept].push(e);
-  });
+  actionable.forEach(function(e){ (byDept[e.dept] = byDept[e.dept] || []).push(e); });
+  var names = Object.keys(byDept).sort();
   var container = document.getElementById("action-sections");
-  Object.keys(byDept).sort().forEach(function(dept){
+  var BATCH = 24;
+
+  function card(e){
+    var tags = e.factors.map(function(f){ return "<span class='factor'>"+f+"</span>"; }).join("");
+    return "<div class='card'>"
+      +"<div class='card-top'><span class='card-id'>#"+e.id+" · "+e.age+" anos</span>"
+      +"<span class='card-prob'><i class='dot' style='background:"+TIER[e.faixa].color+"' title='"+TIER[e.faixa].label+"'></i>"+e.prob.toFixed(0)+"%</span></div>"
+      +"<div class='card-role'>"+e.role+"</div>"
+      +"<div class='card-meta'>Nível "+e.level+" · "+e.years+" ano"+(e.years!==1?"s":"")+" de casa</div>"
+      +"<div class='prob'><span class='track'><i style='width:"+e.prob+"%;background:"+TIER[e.faixa].color+"'></i></span></div>"
+      +(tags ? "<div class='factors'>"+tags+"</div>" : "")
+      +"</div>";
+  }
+
+  names.forEach(function(dept){
     var emps = byDept[dept].sort(function(a,b){return b.prob-a.prob;});
+    var shown = 0;
     var sec = document.createElement("div");
-    sec.className="dept-section";
-    sec.innerHTML="<div class=\\"dept-section-title\\">"+dept+
-      "<span class=\\"count-badge\\">"+emps.length+" colaborador"+(emps.length!==1?"es":"")+"</span></div>"+
-      "<div class=\\"action-cards\\" id=\\"cards-"+dept.replace(/\\s/g,"_")+"\\"</div>";
+    sec.className = "dept-block";
+    sec.dataset.dept = dept;
+    sec.innerHTML = "<div class='dept-block-head'>"
+      +"<span class='avatar' style='background:"+DEPT_COLOR[dept]+"'>"+initials(dept)+"</span>"
+      +"<span class='panel-title' style='font-size:.95rem'>"+dept+"</span>"
+      +"<span class='count'>"+fmt(emps.length)+" colaborador"+(emps.length!==1?"es":"")+"</span></div>"
+      +"<div class='cards'></div>"
+      +"<div class='more'><button class='btn'></button></div>";
     container.appendChild(sec);
-    var cards = sec.querySelector(".action-cards");
-    emps.forEach(function(e){
-      var card = document.createElement("div");
-      card.className="action-card faixa-"+e.faixa;
-      var factTags = e.factors.map(function(f){
-        return "<span class=\\"factor-tag\\">"+f+"</span>";
-      }).join("");
-      card.innerHTML=
-        "<div class=\\"action-card-header\\">"
-          +"<div>"
-            +"<div class=\\"action-card-id\\">ID #"+e.id+"</div>"
-            +"<div class=\\"action-card-role\\">"+e.role+"</div>"
-            +"<div class=\\"action-card-dept\\">"+e.dept+"</div>"
-          +"</div>"
-          +"<div class=\\"action-card-prob "+e.faixa+"\\">"+e.prob.toFixed(0)+"%</div>"
-        +"</div>"
-        +(factTags?"<div class=\\"action-card-factors\\">"+factTags+"</div>":"");
-      cards.appendChild(card);
+    var grid = sec.querySelector(".cards"), more = sec.querySelector(".more button");
+    function showMore(){
+      grid.insertAdjacentHTML("beforeend", emps.slice(shown, shown+BATCH).map(card).join(""));
+      shown = Math.min(emps.length, shown+BATCH);
+      more.textContent = "Mostrar mais ("+fmt(emps.length-shown)+" restantes)";
+      more.parentNode.style.display = shown < emps.length ? "" : "none";
+    }
+    more.addEventListener("click", showMore);
+    showMore();
+  });
+
+  var chips = document.getElementById("acoes-chips");
+  chips.innerHTML = "<button class='chip active' data-d=''>Todos</button>"
+    + names.map(function(d){ return "<button class='chip' data-d='"+d+"'>"+d+"</button>"; }).join("");
+  chips.querySelectorAll(".chip").forEach(function(c){
+    c.addEventListener("click", function(){
+      chips.querySelectorAll(".chip").forEach(function(x){ x.classList.toggle("active", x===c); });
+      container.querySelectorAll(".dept-block").forEach(function(b){
+        b.style.display = !c.dataset.d || b.dataset.dept===c.dataset.d ? "" : "none";
+      });
     });
   });
 })();
 
-// ── sidebar nav active ───────────────────────────────────────────────────────
-function setActive(el){
-  document.querySelectorAll(".nav-item").forEach(function(a){a.classList.remove("active");});
-  el.classList.add("active");
-}
-window.addEventListener("scroll",function(){
-  var sections=[["painel",0],["colaboradores",1],["acoes",2]];
-  var items=document.querySelectorAll(".nav-item");
-  for(var i=sections.length-1;i>=0;i--){
-    var el=document.getElementById(sections[i][0]);
-    if(el && el.getBoundingClientRect().top<=120){
-      items.forEach(function(a){a.classList.remove("active");});
-      items[sections[i][1]].classList.add("active");
-      break;
-    }
-  }
-});
+// ── deep link ────────────────────────────────────────────────────────────────
+var start = location.hash.slice(1);
+if(["colaboradores","acoes"].indexOf(start) >= 0) goTo(start);
 </script>
 </body>
 </html>'''
