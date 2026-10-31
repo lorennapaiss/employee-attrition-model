@@ -2,6 +2,8 @@
 
 Predictive modeling pipeline to identify flight-risk employees, with an operational dashboard for HR Business Partners.
 
+![HR dashboard overview](images/overview.png)
+
 **Dataset:** IBM HR Analytics (Kaggle) — 4,410 employees, 24 features  
 **Model:** XGBoost with regularization to prevent overfitting on the synthetic data  
 **Threshold:** t = 0.35 — captures ~90% recall at ~25–30% precision (asymmetric cost: conversation is cheap, losing talent is not)
@@ -26,6 +28,9 @@ dashboard/
 
 scripts/
   gen_bp_dashboard.py         — Regenerates the dashboard from ranking CSV
+
+images/
+  overview.png, filters.png, actions.png, mobile.png — Dashboard screenshots
 ```
 
 ---
@@ -55,14 +60,37 @@ scripts/
 
 ## HR Dashboard
 
-`dashboard/bp_attrition_dashboard.html` — open in any browser, no server needed.
+`dashboard/bp_attrition_dashboard.html` — open in any browser, no server needed. The interface is in Portuguese, built for Brazilian HR Business Partners.
 
-**Sections:**
-- **Painel Geral** — KPI cards, donut chart by risk tier, stacked bar by department, top roles by average attrition probability
-- **Colaboradores em Risco** — Filterable, sortable, paginated table with probability bars and satisfaction indicators
-- **Acionáveis** — Action cards grouped by department for every employee flagged for preventive conversation
+**Tabs:**
+- **Painel Geral** (overview)
+  - Headline KPIs with micro-charts: probability distribution with the t = 0.35 marker, average risk gauge, share flagged for action
+  - Risk-tier distribution and the 12 highest-risk employees
+  - **Risk by tenure** — average attrition probability by years at the company, per department (toggle each line)
+  - Risk by department (stacked tiers) and the roles that concentrate recommended conversations
+- **Colaboradores** (employees) — filter by tier, department, role and "action only", free-text search, sortable columns, pagination
+- **Acionáveis** (actionable) — one card per employee flagged for a preventive conversation, with probability and risk factors, grouped and filterable by department
 
-**Tech:** Vanilla JS · Chart.js · Google Fonts · all data embedded as JSON — zero build step, zero backend.
+**Export:** the *Exportar CSV* button downloads the current employee filter as a spreadsheet-ready CSV.
+
+**Tech:** Vanilla JS · Chart.js · Google Fonts · all data embedded as JSON — zero build step, zero backend. Department colors are validated for color-vision deficiency; risk tiers are always labeled, never color-only.
+
+To regenerate it after re-running the ranking notebook:
+
+```bash
+python scripts/gen_bp_dashboard.py
+```
+
+### Screenshots
+
+| Employees — filtered (high risk · Sales) | Actionable cards |
+|:---:|:---:|
+| ![Employees table filtered to high risk in Sales](images/filters.png) | ![Actionable cards grouped by department](images/actions.png) |
+
+<p align="center">
+  <img src="images/mobile.png" alt="Overview on a phone" width="300"><br>
+  <sub>Responsive layout on a phone</sub>
+</p>
 
 ---
 
